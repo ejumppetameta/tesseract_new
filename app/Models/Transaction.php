@@ -13,6 +13,7 @@ class Transaction extends Model
         'bank_statement_id',
         'transaction_date',
         'description',
+        'category',
         'debit',
         'credit',
         'balance',
