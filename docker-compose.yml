@@ -9,7 +9,6 @@ services:
     volumes:
       - .:/var/www
     environment:
-      # These environment variables are used by your Laravel .env file
       - APP_ENV=local
       - APP_DEBUG=true
       - DB_CONNECTION=mysql
@@ -44,6 +43,16 @@ services:
       MYSQL_PASSWORD: secret
     volumes:
       - db-data:/var/lib/mysql
+
+  ml:
+    build:
+      context: ./ml
+      dockerfile: Dockerfile.flask
+    container_name: flask-api
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./ml:/app
 
 volumes:
   db-data:

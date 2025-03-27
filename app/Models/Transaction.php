@@ -17,6 +17,9 @@ class Transaction extends Model
         'debit',
         'credit',
         'balance',
+        'type',
+        'reference_number',
+        'dr_mydebit',
     ];
 
     public function bankStatement()

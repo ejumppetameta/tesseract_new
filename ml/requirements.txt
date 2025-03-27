@@ -1,0 +1,11 @@
+Flask==2.2.2
+Werkzeug<3.0.0
+pandas==1.5.3
+scikit-learn==1.6.1
+numpy==1.21.6
+imbalanced-learn
+reportlab==3.6.12
+sqlalchemy
+mysql-connector-python
+nltk
+
