@@ -4,22 +4,19 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\BankStatement;
-use App\Models\Transaction;
-use App\Models\Category; // Make sure this model exists
+use App\Models\Category;
 use Illuminate\Support\Facades\Log;
 use GuzzleHttp\Client;
 
 class PdfOcrController extends Controller
 {
-    // This property will hold our categories mapping from the database.
+    // This property holds our categories records from the database.
     private $categories;
 
     public function process(Request $request)
     {
-        // Load categories from the database and transform them to a mapping of category name => keywords array.
-        $this->categories = Category::all()->mapWithKeys(function ($cat) {
-            return [$cat->name => $cat->keywords];
-        })->toArray();
+        // Load full category records (including 'keywords' and 'type')
+        $this->categories = Category::all()->toArray();
 
         set_time_limit(0);
         $request->validate([
@@ -37,7 +34,6 @@ class PdfOcrController extends Controller
         // Convert PDF pages to images using Imagick
         try {
             $imagick = new \Imagick();
-            // Increase resolution to improve OCR accuracy.
             $imagick->setResolution(300, 300);
             $imagick->readImage($fullPdfPath);
         } catch (\Exception $e) {
@@ -50,24 +46,18 @@ class PdfOcrController extends Controller
             mkdir($tempDir, 0777, true);
         }
 
-        // Run OCR on each page with Tesseract after pre-processing the image.
         $extractedText = "";
         foreach ($imagick as $i => $page) {
             try {
-                // Pre-process the image for better OCR results:
-                // Convert the image to grayscale.
+                // Pre-process image: grayscale, contrast, normalize, set format to png.
                 $page->setImageColorspace(\Imagick::COLORSPACE_GRAY);
-                // Enhance contrast.
                 $page->contrastImage(1);
-                // Normalize the image.
                 $page->normalizeImage();
-                // Optionally, you can apply sharpening here if needed.
                 $page->setImageFormat('png');
 
                 $tempImagePath = $tempDir . "/temp_page_{$i}.png";
                 $page->writeImage($tempImagePath);
 
-                // Call Tesseract with English language and a suitable page segmentation mode.
                 $tesseractCommand = "tesseract " . escapeshellarg($tempImagePath) . " stdout --psm 6 -l eng";
                 $pageText = shell_exec($tesseractCommand);
                 $extractedText .= $pageText . "\n";
@@ -147,7 +137,6 @@ class PdfOcrController extends Controller
 
             if (preg_match('/^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/', $line, $dateMatch)) {
                 $dateToken = $dateMatch[1];
-                // Append the statement year if not present.
                 if (!preg_match('/\/\d{2,4}$/', $dateToken)) {
                     $dateToken .= '/' . $statementYear;
                 }
@@ -187,7 +176,6 @@ class PdfOcrController extends Controller
                 $credit = floatval(str_replace([','], '', $amounts[1]));
                 $balanceVal = floatval(str_replace([','], '', end($amounts)));
             } elseif (count($amounts) == 2) {
-                // If a credit indicator (e.g., "CR") is found in the description, treat the first amount as credit.
                 if (stripos($descriptionPart, 'CR') !== false) {
                     $credit = floatval(str_replace([','], '', $amounts[0]));
                 } else {
@@ -203,11 +191,22 @@ class PdfOcrController extends Controller
             } elseif ($debit > 0) {
                 $type = 'DR';
             } else {
-                $type = 'DR'; // default to DR if no amount is found
+                $type = 'DR';
             }
 
-            // --- Determine the Category Using AI/ML Service with Fallback ---
-            $category = $this->determineCategory($description, $type);
+            // --- Determine the Category Using Both ML and Keyword Matching ---
+            $mlCategory = $this->getMlCategory($description, $type);
+            $keywordCategory = $this->keywordMatchCategory($description, $type);
+
+            if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+                $finalCategory = $mlCategory;
+            } elseif ($keywordCategory !== null) {
+                $finalCategory = $keywordCategory;
+                $this->trainMlCategory($description, $type, $keywordCategory);
+            } else {
+                $finalCategory = 'Uncertain';
+            }
+            $category = $finalCategory;
 
             if ($balanceVal > 1000000000) {
                 Log::info('Skipping transaction due to out-of-range balance: ' . $balanceVal);
@@ -225,7 +224,7 @@ class PdfOcrController extends Controller
             ]);
 
             if ($debit != 0.0 || $credit != 0.0 || $balanceVal != 0.0) {
-                $lastTransaction = $statementRecord->transactions()->create([
+                $lastTransaction = $statementRecord->vtableRecords()->create([
                     'transaction_date' => $lastTransactionDate,
                     'description'      => $description,
                     'category'         => $category,
@@ -251,7 +250,7 @@ class PdfOcrController extends Controller
             $statementRecord->closing_balance = $closingBalance;
             $statementRecord->save();
         } else {
-            $lastTransactionRecord = $statementRecord->transactions()->orderBy('transaction_date', 'desc')->first();
+            $lastTransactionRecord = $statementRecord->vtableRecords()->orderBy('transaction_date', 'desc')->first();
             if ($lastTransactionRecord) {
                 $statementRecord->closing_balance = $lastTransactionRecord->balance;
                 $statementRecord->save();
@@ -266,8 +265,7 @@ class PdfOcrController extends Controller
     }
 
     /**
-     * Determines the category of a transaction based on its description and type.
-     * First, tries the ML service. If that fails, falls back to keyword matching.
+     * Determines the category of a transaction using both ML prediction and keyword matching.
      *
      * @param string $description
      * @param string $type
@@ -275,27 +273,43 @@ class PdfOcrController extends Controller
      */
     private function determineCategory($description, $type)
     {
-        // Try to get the category using the ML service.
         $mlCategory = $this->getMlCategory($description, $type);
-        if ($mlCategory !== null) {
-            return $mlCategory;
-        }
+        $keywordCategory = $this->keywordMatchCategory($description, $type);
 
-        // Fallback to keyword matching.
-        $descUpper = strtoupper($description);
-        foreach ($this->categories as $category => $keywords) {
-            foreach ($keywords as $keyword) {
-                if (strpos($descUpper, strtoupper($keyword)) !== false) {
-                    return $category;
+        if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+            return $mlCategory;
+        } elseif ($keywordCategory !== null) {
+            $this->trainMlCategory($description, $type, $keywordCategory);
+            return $keywordCategory;
+        }
+        return 'Uncertain';
+    }
+
+    /**
+     * Uses keyword matching to determine a category.
+     *
+     * @param string $description
+     * @param string $type
+     * @return string|null
+     */
+    private function keywordMatchCategory($description, $type)
+    {
+        $description = strtolower($description);
+        foreach ($this->categories as $cat) {
+            if (strcasecmp($cat['type'], $type) !== 0) {
+                continue;
+            }
+            foreach ($cat['keywords'] as $keyword) {
+                if (preg_match('/\b' . preg_quote(strtolower($keyword), '/') . '\b/', $description)) {
+                    return $cat['name'];
                 }
             }
         }
-        return 'Others';
+        return null;
     }
 
     /**
      * Calls the ML service to get a predicted category.
-     * Returns the category as a string if successful, or null if it fails.
      *
      * @param string $description
      * @param string $type
@@ -305,7 +319,6 @@ class PdfOcrController extends Controller
     {
         try {
             $client = new Client(['timeout' => 5]);
-            // Using the Docker Compose service name "ml" to call the ML API.
             $response = $client->post('http://ml:5000/predict', [
                 'json' => [
                     'text' => $description,
@@ -314,11 +327,38 @@ class PdfOcrController extends Controller
             ]);
             $result = json_decode($response->getBody(), true);
             if (isset($result['category']) && !empty($result['category'])) {
-                return $result['category'];
+                $confidence = isset($result['confidence']) ? (float)$result['confidence'] : 1.0;
+                if ($confidence >= 0.7) {
+                    return $result['category'];
+                }
+                Log::info("ML prediction confidence too low ({$confidence}) for: {$description}");
             }
         } catch (\Exception $e) {
             Log::error("ML service error: " . $e->getMessage());
         }
         return null;
+    }
+
+    /**
+     * Trains the ML service with the provided category.
+     *
+     * @param string $description
+     * @param string $type
+     * @param string $category
+     */
+    private function trainMlCategory($description, $type, $category)
+    {
+        try {
+            $client = new Client(['timeout' => 5]);
+            $client->post('http://ml:5000/train', [
+                'json' => [
+                    'text'     => $description,
+                    'type'     => $type,
+                    'category' => $category
+                ]
+            ]);
+        } catch (\Exception $e) {
+            Log::error("ML training error: " . $e->getMessage());
+        }
     }
 }

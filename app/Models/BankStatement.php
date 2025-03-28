@@ -22,4 +22,11 @@ class BankStatement extends Model
     {
         return $this->hasMany(Transaction::class);
     }
+
+    // New relationship for VTable records
+    public function vtableRecords()
+    {
+        return $this->hasMany(VTable::class, 'bank_statement_id');
+    }
 }
+

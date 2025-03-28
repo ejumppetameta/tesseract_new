@@ -169,6 +169,10 @@
             <input type="text" name="name" id="name" class="form-control" required>
           </div>
           <div class="form-group">
+            <label for="type">Type:</label>
+            <input type="text" name="type" id="type" class="form-control" required>
+          </div>
+          <div class="form-group">
             <label for="keywords">Keywords (comma separated):</label>
             <input type="text" name="keywords" id="keywords" class="form-control" required>
           </div>
@@ -186,6 +190,7 @@
             <tr>
               <th>ID</th>
               <th>Name</th>
+              <th>Type</th>
               <th>Keywords</th>
               <th>Actions</th>
             </tr>
@@ -214,6 +219,10 @@
             <div class="form-group">
               <label for="edit-name">Category Name:</label>
               <input type="text" name="name" id="edit-name" class="form-control" required>
+            </div>
+            <div class="form-group">
+              <label for="edit-type">Type:</label>
+              <input type="text" name="type" id="edit-type" class="form-control" required>
             </div>
             <div class="form-group">
               <label for="edit-keywords">Keywords (comma separated):</label>
@@ -248,9 +257,16 @@
                 <tr>
                   <td>${category.id}</td>
                   <td>${category.name}</td>
+                  <td>${category.type}</td>
                   <td>${keywords}</td>
                   <td>
-                    <button class="btn btn-sm btn-info edit-btn" data-id="${category.id}" data-name="${category.name}" data-keywords="${keywords}">Edit</button>
+                    <button class="btn btn-sm btn-info edit-btn"
+                      data-id="${category.id}"
+                      data-name="${category.name}"
+                      data-type="${category.type}"
+                      data-keywords="${keywords}">
+                      Edit
+                    </button>
                     <button class="btn btn-sm btn-danger delete-btn" data-id="${category.id}">Delete</button>
                   </td>
                 </tr>
@@ -258,7 +274,7 @@
               tbody.append(row);
             });
           } else {
-            tbody.html('<tr><td colspan="4" class="text-center">No categories found.</td></tr>');
+            tbody.html('<tr><td colspan="5" class="text-center">No categories found.</td></tr>');
           }
         })
         .catch(function(error) {
@@ -275,8 +291,9 @@
       $('#add-category-form').submit(function(e) {
         e.preventDefault();
         var name = $('#name').val();
+        var type = $('#type').val();
         var keywords = $('#keywords').val().split(',').map(item => item.trim()).filter(item => item);
-        axios.post('/api/categories', { name: name, keywords: keywords })
+        axios.post('/api/categories', { name: name, type: type, keywords: keywords })
           .then(function(response) {
             alert(response.data.message);
             $('#add-category-form')[0].reset();
@@ -292,9 +309,11 @@
       $(document).on('click', '.edit-btn', function() {
         var id = $(this).data('id');
         var name = $(this).data('name');
+        var type = $(this).data('type');
         var keywords = $(this).data('keywords');
         $('#edit-category-id').val(id);
         $('#edit-name').val(name);
+        $('#edit-type').val(type);
         $('#edit-keywords').val(keywords);
         $('#editCategoryModal').modal('show');
       });
@@ -304,8 +323,9 @@
         e.preventDefault();
         var id = $('#edit-category-id').val();
         var name = $('#edit-name').val();
+        var type = $('#edit-type').val();
         var keywords = $('#edit-keywords').val().split(',').map(item => item.trim()).filter(item => item);
-        axios.put('/api/categories/' + id, { name: name, keywords: keywords })
+        axios.put('/api/categories/' + id, { name: name, type: type, keywords: keywords })
           .then(function(response) {
             alert(response.data.message);
             $('#editCategoryModal').modal('hide');

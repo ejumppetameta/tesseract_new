@@ -4,22 +4,19 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\BankStatement;
-use App\Models\Transaction;
 use App\Models\Category;
 use Illuminate\Support\Facades\Log;
 use GuzzleHttp\Client;
 
 class PdfOcrControllerMaybank extends Controller
 {
-    // Holds the categories mapping from the database.
+    // This property holds our full category records from the database.
     private $categories;
 
     public function process(Request $request)
     {
-        // Load categories from the database as a mapping: category => keywords.
-        $this->categories = Category::all()->mapWithKeys(function ($cat) {
-            return [$cat->name => $cat->keywords];
-        })->toArray();
+        // Load full category records (including 'keywords' and 'type')
+        $this->categories = Category::all()->toArray();
 
         set_time_limit(0);
         $request->validate([
@@ -44,20 +41,17 @@ class PdfOcrControllerMaybank extends Controller
             return response()->json(['error' => 'Error reading PDF: ' . $e->getMessage()], 500);
         }
 
-        // Directory for temporary images.
+        // Create temporary images directory if needed.
         $tempDir = storage_path('app' . DIRECTORY_SEPARATOR . 'temp_images');
         if (!is_dir($tempDir)) {
             mkdir($tempDir, 0777, true);
         }
 
-        // Run OCR on each page with Tesseract after pre-processing the image.
         $extractedText = "";
         foreach ($imagick as $i => $page) {
             try {
-                // Pre-process the image for better OCR results:
-                // Convert to grayscale.
+                // Pre-process image: grayscale, contrast, normalize, set format to png.
                 $page->setImageColorspace(\Imagick::COLORSPACE_GRAY);
-                // Enhance contrast and normalize the image.
                 $page->contrastImage(1);
                 $page->normalizeImage();
                 $page->setImageFormat('png');
@@ -65,32 +59,32 @@ class PdfOcrControllerMaybank extends Controller
                 $tempImagePath = $tempDir . "/temp_page_{$i}.png";
                 $page->writeImage($tempImagePath);
 
-                // Using Tesseract with english language and a suitable page segmentation mode.
+                // Run Tesseract OCR with English language.
                 $tesseractCommand = "tesseract " . escapeshellarg($tempImagePath) . " stdout --psm 6 -l eng";
                 $pageText = shell_exec($tesseractCommand);
                 $extractedText .= $pageText . "\n";
             } catch (\Exception $e) {
                 Log::error("OCR error on page {$i}: " . $e->getMessage());
             } finally {
-                if (file_exists($tempImagePath)) {
+                if (isset($tempImagePath) && file_exists($tempImagePath)) {
                     unlink($tempImagePath);
                 }
             }
         }
         $imagick->destroy();
 
-        // --- Parse Header Information ---
-        $accountNumber = 'Unknown';
-        $statementDate = null;
+        // --- Parse Header Information (Maybank version) ---
+        // Note: The header parsing below is adjusted for Maybank PDFs.
         $accountHolder = 'Unknown';
+        $accountNumber = 'Unknown';
         $accountType = 'Savings';
+        $statementDate = null;
 
-        // Extract account_holder: only capture contiguous uppercase letters (and spaces)
+        // Extract account_holder: capture contiguous uppercase letters (and spaces) after "TARIKH PENYATA"
         if (preg_match('/TARIKH PENYATA\s*\n([A-Z\s]+)(?:\s|$)/m', $extractedText, $match)) {
             $accountHolder = trim($match[1]);
         }
-
-        // Extract statement_date: capture dd/mm/yy after the account_holder text
+        // Extract statement_date: capture dd/mm/yy after the account_holder text.
         if (preg_match('/TARIKH PENYATA\s*\n[A-Z\s]+.*?(\d{2}\/\d{2}\/\d{2})/m', $extractedText, $match)) {
             $rawDate = trim($match[1]);
             $parts = explode('/', $rawDate);
@@ -104,20 +98,18 @@ class PdfOcrControllerMaybank extends Controller
                 $statementDate = date('Y-m-d', strtotime($rawDate));
             }
         }
-
         // Extract account_number: number preceding "\nNUMBER"
         if (preg_match('/(\d{6,}-\d{6,})\s*\nNUMBER/i', $extractedText, $match)) {
             $accountNumber = trim($match[1]);
         }
-
-        // Extract account_type: text following the specific phrase, then remove trailing extra text.
+        // Extract account_type: text following a specific phrase.
         if (preg_match('/PROTECTED BY PIDM UP TO RM250,000 FOR EACH DEPOSITOR\s+([A-Z0-9\s\-]+)/i', $extractedText, $match)) {
             $rawAccountType = trim($match[1]);
             $accountTypeParts = explode("\n", $rawAccountType);
             $accountType = trim($accountTypeParts[0]);
         }
 
-        // Create the Bank Statement record.
+        // Create Bank Statement record.
         $statementRecord = BankStatement::create([
             'bank_name'       => 'Maybank Berhad',
             'account_holder'  => $accountHolder,
@@ -151,11 +143,13 @@ class PdfOcrControllerMaybank extends Controller
                 ) {
                     continue;
                 }
-                if ($trimmedLine === '') continue;
+                if ($trimmedLine === '') {
+                    continue;
+                }
                 $transactionLines[] = $trimmedLine;
             }
         }
-        Log::info('Maybank Transaction Lines Extracted: ' . json_encode($transactionLines));
+        Log::info('Transaction Lines Extracted: ' . json_encode($transactionLines));
 
         // Combine multi-line transaction rows.
         $transactionsCombined = [];
@@ -175,106 +169,130 @@ class PdfOcrControllerMaybank extends Controller
         }
 
         // --- Process Each Transaction ---
-        foreach ($transactionsCombined as $transLine) {
-            $transLine = trim($transLine);
-            if (empty($transLine)) {
+        $lastTransactionDate = null;
+        $lastTransaction = null;
+        foreach ($transactionsCombined as $line) {
+            $line = trim($line);
+            if ($line === '') {
                 continue;
             }
-            if (preg_match('/^(?<date>\d{2}\/\d{2}\/\d{2})\s*\|\s*(?<rest>.+)$/s', $transLine, $matches)) {
-                $dateToken = $matches['date'];
-                $remaining = $matches['rest'];
+
+            if (preg_match('/^(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/', $line, $dateMatch)) {
+                $dateToken = $dateMatch[1];
+                if (!preg_match('/\/\d{2,4}$/', $dateToken)) {
+                    $dateToken .= '/' . date('Y', strtotime($statementDate));
+                }
+                $lastTransactionDate = date('Y-m-d', strtotime($dateToken));
+                $descriptionPart = trim(substr($line, strlen($dateMatch[1])));
             } else {
-                if (preg_match('/^(\d{2}\/\d{2}\/\d{2})/', $transLine, $dateMatch)) {
-                    $dateToken = $dateMatch[1];
-                    $remaining = trim(substr($transLine, strlen($dateToken)));
+                if ($lastTransactionDate === null) {
+                    Log::info('Skipping line with no date and no previous date: ' . $line);
+                    continue;
+                }
+                $descriptionPart = $line;
+            }
+
+            $tokens = explode(' ', $descriptionPart);
+            $amounts = [];
+            $descTokens = [];
+            $amountRegex = '/^(\d{1,3}(?:,\d{3})*\.\d{2})([A-Za-z].*)?$/';
+
+            foreach ($tokens as $token) {
+                if (preg_match($amountRegex, $token, $matchAmt)) {
+                    $amounts[] = $matchAmt[1];
+                    if (isset($matchAmt[2]) && trim($matchAmt[2]) !== '') {
+                        $descTokens[] = trim($matchAmt[2]);
+                    }
                 } else {
-                    Log::info("Skipping transaction with no date: " . $transLine);
-                    continue;
+                    $descTokens[] = $token;
                 }
             }
-            $parts = explode('/', $dateToken);
-            if (count($parts) == 3) {
-                list($day, $month, $year) = $parts;
-                if (strlen($year) == 2) {
-                    $year = '20' . $year;
-                }
-                $transactionDate = "$year-$month-$day";
-            } else {
-                $transactionDate = date('Y-m-d', strtotime($dateToken));
-            }
-
-            $descriptionFull = $remaining;
-            if (preg_match('/(?P<amount>[\d,]+\.\d{2}[+-])\s+(?P<balance>[\d,]+\.\d{2})/', $remaining, $matchValues)) {
-                $amountToken = $matchValues['amount'];
-                $balanceToken = $matchValues['balance'];
-                $description = trim(preg_replace('/' . preg_quote($matchValues[0], '/') . '/', '', $remaining, 1));
-            } else {
-                $tokens = preg_split('/\s+/', $remaining);
-                if (count($tokens) < 3) {
-                    continue;
-                }
-                $balanceToken = array_pop($tokens);
-                $amountToken = array_pop($tokens);
-                $description = implode(' ', $tokens);
-            }
-
-            $descTokens = explode(' ', $description);
-            while (!empty($descTokens) && preg_match('/^[A-Z]{2,3}-?$/', end($descTokens))) {
-                array_pop($descTokens);
-            }
-            $description = trim(implode(' ', $descTokens));
 
             $debit = 0.0;
             $credit = 0.0;
-            $amountToken = trim($amountToken);
-            if (strlen($amountToken) > 1) {
-                $sign = substr($amountToken, -1);
-                $amountNum = substr($amountToken, 0, -1);
-                $amountVal = floatval(str_replace([','], '', $amountNum));
-                if ($sign === '+') {
-                    $credit = $amountVal;
-                } elseif ($sign === '-') {
-                    $debit = $amountVal;
+            $balanceVal = 0.0;
+            if (count($amounts) == 1) {
+                $balanceVal = floatval(str_replace([','], '', $amounts[0]));
+            } elseif (count($amounts) >= 3) {
+                $debit = floatval(str_replace([','], '', $amounts[0]));
+                $credit = floatval(str_replace([','], '', $amounts[1]));
+                $balanceVal = floatval(str_replace([','], '', end($amounts)));
+            } elseif (count($amounts) == 2) {
+                if (stripos($descriptionPart, 'CR') !== false) {
+                    $credit = floatval(str_replace([','], '', $amounts[0]));
+                } else {
+                    $debit = floatval(str_replace([','], '', $amounts[0]));
                 }
+                $balanceVal = floatval(str_replace([','], '', $amounts[1]));
+            }
+            $description = substr(implode(' ', $descTokens), 0, 255);
+
+            // --- Determine transaction type: CR for credit and DR for debit ---
+            if ($credit > 0) {
+                $type = 'CR';
+            } elseif ($debit > 0) {
+                $type = 'DR';
+            } else {
+                $type = 'DR';
             }
 
-            // Determine transaction type: CR for credit and DR for debit.
-            $type = ($credit > 0) ? 'CR' : 'DR';
+            // --- Determine the Category Using Both ML and Keyword Matching ---
+            $mlCategory = $this->getMlCategory($description, $type);
+            $keywordCategory = $this->keywordMatchCategory($description, $type);
 
-            // --- Determine the Category and Type Using AI/ML or Fallback ---
-            $categoryTypeData = $this->determineCategoryAndType($description, $debit, $credit);
-            $category = $categoryTypeData['category'];
-            $type = $categoryTypeData['type'];
+            if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+                $finalCategory = $mlCategory;
+            } elseif ($keywordCategory !== null) {
+                $finalCategory = $keywordCategory;
+                $this->trainMlCategory($description, $type, $keywordCategory);
+            } else {
+                $finalCategory = 'Uncertain';
+            }
+            $category = $finalCategory;
 
-            Log::info('Parsed Maybank Transaction Data', [
-                'date'        => $transactionDate,
+            if ($balanceVal > 1000000000) {
+                Log::info('Skipping transaction due to out-of-range balance: ' . $balanceVal);
+                continue;
+            }
+
+            Log::info('Parsed Transaction Data', [
+                'date'        => $lastTransactionDate,
                 'description' => $description,
                 'category'    => $category,
                 'debit'       => $debit,
                 'credit'      => $credit,
-                'balance'     => floatval(str_replace([','], '', trim($balanceToken))),
+                'balance'     => $balanceVal,
                 'type'        => $type,
             ]);
 
-            // Create the transaction record.
-            $statementRecord->transactions()->create([
-                'transaction_date' => $transactionDate,
-                'description'      => substr($description, 0, 100),
-                'category'         => $category,
-                'debit'            => $debit,
-                'credit'           => $credit,
-                'balance'          => floatval(str_replace([','], '', trim($balanceToken))),
-                'type'             => $type,
-            ]);
+            if ($debit != 0.0 || $credit != 0.0 || $balanceVal != 0.0) {
+                $lastTransaction = $statementRecord->vtableRecords()->create([
+                    'transaction_date' => $lastTransactionDate,
+                    'description'      => $description,
+                    'category'         => $category,
+                    'debit'            => $debit,
+                    'credit'           => $credit,
+                    'balance'          => $balanceVal,
+                    'type'             => $type,
+                ]);
+            } else {
+                if ($lastTransaction) {
+                    $mergedDescription = trim($lastTransaction->description . ' ' . $description);
+                    $lastTransaction->update([
+                        'description' => substr($mergedDescription, 0, 100),
+                        'category'    => $this->determineCategory($mergedDescription, $type)
+                    ]);
+                }
+            }
         }
 
         // --- Update Statement's Closing Balance ---
-        if (preg_match('/ENDING BALANCE\s*:\s*([\d,]+\.\d{2})/i', $extractedText, $match)) {
+        if (preg_match('/Closing Balance(?: In This Statement)?\s+([\d,]+\.\d{2})/i', $extractedText, $match)) {
             $closingBalance = floatval(str_replace([','], '', $match[1]));
             $statementRecord->closing_balance = $closingBalance;
             $statementRecord->save();
         } else {
-            $lastTransactionRecord = $statementRecord->transactions()->orderBy('transaction_date', 'desc')->first();
+            $lastTransactionRecord = $statementRecord->vtableRecords()->orderBy('transaction_date', 'desc')->first();
             if ($lastTransactionRecord) {
                 $statementRecord->closing_balance = $lastTransactionRecord->balance;
                 $statementRecord->save();
@@ -289,41 +307,100 @@ class PdfOcrControllerMaybank extends Controller
     }
 
     /**
-     * Determines the category and type of a transaction based on its description.
+     * Determines the category of a transaction using both ML prediction and keyword matching.
      *
      * @param string $description
-     * @param float $debit
-     * @param float $credit
-     * @return array
+     * @param string $type
+     * @return string
      */
-    private function determineCategoryAndType($description, $debit, $credit)
+    private function determineCategory($description, $type)
     {
-        $type = ($credit > 0) ? 'CR' : 'DR';
+        $mlCategory = $this->getMlCategory($description, $type);
+        $keywordCategory = $this->keywordMatchCategory($description, $type);
 
-        // Attempt AI/ML prediction.
-        try {
-            $client = new Client(['timeout' => 5]);
-            $response = $client->post('http://ml:5000/predict', [
-                'json' => ['text' => $description]
-            ]);
-            $result = json_decode($response->getBody(), true);
-            if (isset($result['category'])) {
-                return ['category' => $result['category'], 'type' => $type];
-            }
-        } catch (\Exception $e) {
-            Log::error('AI/ML service error: ' . $e->getMessage());
+        if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+            return $mlCategory;
+        } elseif ($keywordCategory !== null) {
+            $this->trainMlCategory($description, $type, $keywordCategory);
+            return $keywordCategory;
         }
+        return 'Uncertain';
+    }
 
-        // Fallback: keyword matching.
-        $descUpper = strtoupper($description);
-        foreach ($this->categories as $category => $keywords) {
-            foreach ($keywords as $keyword) {
-                if (strpos($descUpper, strtoupper($keyword)) !== false) {
-                    return ['category' => $category, 'type' => $type];
+    /**
+     * Uses keyword matching to determine a category.
+     *
+     * @param string $description
+     * @param string $type
+     * @return string|null
+     */
+    private function keywordMatchCategory($description, $type)
+    {
+        $description = strtolower($description);
+        foreach ($this->categories as $cat) {
+            if (strcasecmp($cat['type'], $type) !== 0) {
+                continue;
+            }
+            foreach ($cat['keywords'] as $keyword) {
+                if (preg_match('/\b' . preg_quote(strtolower($keyword), '/') . '\b/', $description)) {
+                    return $cat['name'];
                 }
             }
         }
+        return null;
+    }
 
-        return ['category' => 'Others', 'type' => $type];
+    /**
+     * Calls the ML service to get a predicted category.
+     *
+     * @param string $description
+     * @param string $type
+     * @return string|null
+     */
+    private function getMlCategory($description, $type)
+    {
+        try {
+            $client = new Client(['timeout' => 5]);
+            $response = $client->post('http://ml:5000/predict', [
+                'json' => [
+                    'text' => $description,
+                    'type' => $type
+                ]
+            ]);
+            $result = json_decode($response->getBody(), true);
+            if (isset($result['category']) && !empty($result['category'])) {
+                $confidence = isset($result['confidence']) ? (float)$result['confidence'] : 1.0;
+                if ($confidence >= 0.7) {
+                    return $result['category'];
+                }
+                Log::info("ML prediction confidence too low ({$confidence}) for: {$description}");
+            }
+        } catch (\Exception $e) {
+            Log::error("ML service error: " . $e->getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Trains the ML service with the provided category.
+     *
+     * @param string $description
+     * @param string $type
+     * @param string $category
+     */
+    private function trainMlCategory($description, $type, $category)
+    {
+        try {
+            $client = new Client(['timeout' => 5]);
+            $client->post('http://ml:5000/train', [
+                'json' => [
+                    'text'     => $description,
+                    'type'     => $type,
+                    'category' => $category
+                ]
+            ]);
+        } catch (\Exception $e) {
+            Log::error("ML training error: " . $e->getMessage());
+        }
     }
 }

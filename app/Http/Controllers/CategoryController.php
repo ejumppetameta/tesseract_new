@@ -47,6 +47,7 @@ class CategoryController extends Controller
         $validated = $request->validate([
             'name'     => 'required|string|unique:categories,name',
             'keywords' => 'required|array',
+            'type'     => 'required|string'
         ]);
 
         try {
@@ -72,6 +73,7 @@ class CategoryController extends Controller
             $validated = $request->validate([
                 'name'     => 'sometimes|required|string|unique:categories,name,' . $category->id,
                 'keywords' => 'sometimes|required|array',
+                'type'     => 'sometimes|required|string'
             ]);
             $category->update($validated);
             return response()->json([

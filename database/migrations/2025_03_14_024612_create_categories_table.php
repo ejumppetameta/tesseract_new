@@ -13,6 +13,7 @@ class CreateCategoriesTable extends Migration
             $table->string('name')->unique();
             // Store keywords as a JSON array.
             $table->json('keywords');
+            $table->string('type')->nullable();
             $table->timestamps();
         });
     }

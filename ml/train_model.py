@@ -1,33 +1,27 @@
 import os
-import re
 import pickle
 import pandas as pd
 from sqlalchemy import create_engine
-
-# NLTK imports for lemmatization (no need for word_tokenize now)
 import nltk
-# Download only required resources for lemmatization
+from collections import Counter
+from sklearn.preprocessing import LabelEncoder
+import numpy as np
+
+# Download necessary NLTK resources
 nltk.download('wordnet')
 nltk.download('omw-1.4')
 
-# Import our custom preprocessor from the separate module.
+# Import custom preprocessor
 from preprocessing import custom_preprocessor
 
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, confusion_matrix
-
-# imblearn pipeline for SMOTE and classifier
 from imblearn.pipeline import Pipeline as ImbPipeline
-from imblearn.over_sampling import SMOTE
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+from xgboost import XGBClassifier  # XGBoost for better performance
 
 def determine_type(desc):
-    """
-    Determine the transaction type based on the description.
-    Returns 'CR' if 'CR' is found in the text, 'DR' if 'DR' is found,
-    or defaults to 'DR' if neither is found.
-    """
     desc_upper = desc.upper()
     if 'CR' in desc_upper:
         return 'CR'
@@ -38,9 +32,13 @@ def determine_type(desc):
 
 def build_vectorizer():
     """
-    Build a TfidfVectorizer that uses the custom preprocessor and English stopwords.
+    Builds a TF-IDF Vectorizer with character n-grams for better feature extraction.
     """
-    vectorizer = TfidfVectorizer(stop_words='english', preprocessor=custom_preprocessor)
+    vectorizer = TfidfVectorizer(
+        stop_words='english',
+        preprocessor=custom_preprocessor,
+        ngram_range=(1, 3)  # Uses word-level and character-level n-grams
+    )
     return vectorizer
 
 def load_data(engine):
@@ -54,36 +52,51 @@ def load_data(engine):
 
 def train_category_model(X_train, y_train):
     """
-    Build and train an imblearn pipeline for the category model using SMOTE and Logistic Regression.
-    A grid search is performed to optimize hyperparameters.
+    Train an XGBoost model using an imbalanced-learn pipeline.
+    This version first checks the class distribution. If any class has fewer than 2 samples,
+    it uses RandomOverSampler; otherwise, it uses SMOTE.
     """
+    category_counts = Counter(y_train)
+    min_samples = min(category_counts.values())
+
+    if min_samples < 2:
+        print("Warning: Some classes have fewer than 2 samples. Using RandomOverSampler instead of SMOTE.")
+        oversampler = RandomOverSampler(random_state=42)
+    else:
+        # Use SMOTE with k_neighbors adjusted to the smallest class size
+        smote_neighbors = max(1, min_samples - 1)
+        oversampler = SMOTE(random_state=42, k_neighbors=smote_neighbors)
+
     pipeline = ImbPipeline([
-        ('smote', SMOTE(random_state=42, k_neighbors=1)),
-        ('clf', LogisticRegression(class_weight='balanced', max_iter=1000))
+        ('oversample', oversampler),
+        ('clf', XGBClassifier(
+            use_label_encoder=False,
+            eval_metric="mlogloss",
+            objective='multi:softprob',
+            n_estimators=100,
+            learning_rate=0.1,
+            max_depth=5
+        ))
     ])
 
-    # Define grid search parameters; expand this grid as needed.
-    param_grid = {
-        'clf__C': [0.1, 1, 10],
-        'clf__solver': ['liblinear', 'saga']
-    }
-
-    grid = GridSearchCV(pipeline, param_grid, cv=3, n_jobs=-1, verbose=1)
-    grid.fit(X_train, y_train)
-
-    print("Best hyperparameters for category model:", grid.best_params_)
-    return grid.best_estimator_
+    pipeline.fit(X_train, y_train)
+    return pipeline
 
 def train_type_model(X, y_type):
     """
-    Train a simple Logistic Regression model for the type prediction.
+    Train an XGBoost model for predicting transaction type.
     """
-    model = LogisticRegression(class_weight='balanced', max_iter=1000, solver='liblinear')
+    model = XGBClassifier(
+        use_label_encoder=False,
+        eval_metric="logloss",
+        n_estimators=100,
+        learning_rate=0.1,
+        max_depth=5
+    )
     model.fit(X, y_type)
     return model
 
 def main():
-    # Pull MySQL connection parameters from environment variables.
     MYSQL_USER = os.environ.get("MYSQL_USER", "laraveluser")
     MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "secret")
     MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
@@ -96,79 +109,60 @@ def main():
     )
     engine = create_engine(connection_string)
 
-    # Load data from MySQL into a DataFrame.
     data = load_data(engine)
     if data is None:
         return
 
-    # Verify required columns exist.
-    for col in ['description', 'category', 'type']:
-        if col not in data.columns:
-            print(f"Data must contain the '{col}' column")
-            return
-
-    # Use heuristic for 'type' if all values are null.
-    if data['type'].isnull().all():
+    if 'type' not in data or data['type'].isnull().all():
         data['type'] = data['description'].apply(determine_type)
-        print("Added 'type' column based on description heuristic.")
-    else:
-        print("Using existing 'type' column for training.")
+        print("Generated 'type' column based on description.")
 
-    print("Overall category distribution:")
+    print("Category Distribution Before Training:")
     print(data['category'].value_counts())
 
-    # Build and fit the TF-IDF vectorizer.
     vectorizer = build_vectorizer()
-    try:
-        X_all = vectorizer.fit_transform(data['description'])
-    except Exception as e:
-        print("Error during vectorizer fitting:", e)
-        return
+    X_all = vectorizer.fit_transform(data['description'])
 
-    print("Vectorizer idf shape:", vectorizer.idf_.shape)
+    # Encode category and type labels using LabelEncoder
+    le_category = LabelEncoder()
+    y_category = le_category.fit_transform(data['category'])
+    le_type = LabelEncoder()
+    y_type = le_type.fit_transform(data['type'])
 
-    # -------------------- Train Category Model -------------------- #
+    # Train-Test Split for category model
     X_train, X_test, y_train, y_test = train_test_split(
-        X_all, data['category'], test_size=0.2, random_state=42)
+        X_all, y_category, test_size=0.2, random_state=42)
 
-    print("Training data category distribution:")
-    print(y_train.value_counts())
+    # Train Category Model with XGBoost and an appropriate oversampler
+    model_category = train_category_model(X_train, y_train)
 
-    # Filter out categories with fewer than 2 samples for SMOTE stability.
-    valid_categories = y_train.value_counts()[y_train.value_counts() >= 2].index.tolist()
-    valid_mask = y_train.isin(valid_categories).to_numpy()
-    X_train_valid = X_train[valid_mask]
-    y_train_valid = y_train[valid_mask]
-    print("Categories with at least 2 samples:", valid_categories)
-
-    # Train category model using pipeline with grid search.
-    model_category = train_category_model(X_train_valid, y_train_valid)
-
-    # Evaluate category model on the test set.
+    # Evaluate Category Model
     y_pred = model_category.predict(X_test)
     print("Category Model - Confusion Matrix:")
     print(confusion_matrix(y_test, y_pred))
+    unique_labels = np.unique(y_test)
+    target_names = le_category.inverse_transform(unique_labels)
     print("Category Model - Classification Report:")
-    print(classification_report(y_test, y_pred))
+    print(classification_report(y_test, y_pred, labels=unique_labels, target_names=target_names))
 
-    # -------------------- Train Type Model -------------------- #
-    y_type = data['type']
+    # Train Type Model on full data
     model_type = train_type_model(X_all, y_type)
 
-    # -------------------- Save Models and Vectorizer -------------------- #
+    # Save Models, Vectorizer, and Label Encoders
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    model_category_path = os.path.join(script_dir, 'model_category.pkl')
-    model_type_path = os.path.join(script_dir, 'model_type.pkl')
-    vectorizer_path = os.path.join(script_dir, 'vectorizer.pkl')
-
-    with open(model_category_path, 'wb') as f:
+    with open(os.path.join(script_dir, 'model_category.pkl'), 'wb') as f:
         pickle.dump(model_category, f)
-    with open(model_type_path, 'wb') as f:
+    with open(os.path.join(script_dir, 'model_type.pkl'), 'wb') as f:
         pickle.dump(model_type, f)
-    with open(vectorizer_path, 'wb') as f:
+    with open(os.path.join(script_dir, 'vectorizer.pkl'), 'wb') as f:
         pickle.dump(vectorizer, f)
+    with open(os.path.join(script_dir, 'le_category.pkl'), 'wb') as f:
+        pickle.dump(le_category, f)
+    with open(os.path.join(script_dir, 'le_type.pkl'), 'wb') as f:
+        pickle.dump(le_type, f)
 
-    print("Models and vectorizer trained and saved successfully in:", script_dir)
+    print("Models, vectorizer, and label encoders saved successfully.")
 
 if __name__ == '__main__':
     main()
+
