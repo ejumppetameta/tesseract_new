@@ -5,11 +5,15 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use App\Models\BankStatement;
 use App\Models\Category;
+use App\Models\TrainData;
 use Illuminate\Support\Facades\Log;
 use GuzzleHttp\Client;
+use App\Http\Controllers\Traits\PdfOcrCommonTrait;
 
 class PdfOcrController extends Controller
 {
+    use PdfOcrCommonTrait;
+
     // This property holds our categories records from the database.
     private $categories;
 
@@ -128,7 +132,7 @@ class PdfOcrController extends Controller
 
         // --- Process Each Transaction Line Separately ---
         $lastTransactionDate = null;
-        $lastTransaction = null;
+        $lastTransaction = null; // This will hold the last saved Transaction record.
         foreach ($transactionLines as $line) {
             $line = trim($line);
             if ($line === '') {
@@ -183,29 +187,13 @@ class PdfOcrController extends Controller
                 }
                 $balanceVal = floatval(str_replace([','], '', $amounts[1]));
             }
-            $description = substr(implode(' ', $descTokens), 0, 255);
+            $description = substr(implode(' ', $descTokens), 0, 100);
 
-            // --- Determine transaction type: CR for credit and DR for debit ---
-            if ($credit > 0) {
-                $type = 'CR';
-            } elseif ($debit > 0) {
-                $type = 'DR';
-            } else {
-                $type = 'DR';
-            }
+            // --- Determine transaction type ---
+            $type = ($credit > 0) ? 'CR' : 'DR';
 
-            // --- Determine the Category Using Both ML and Keyword Matching ---
-            $mlCategory = $this->getMlCategory($description, $type);
-            $keywordCategory = $this->keywordMatchCategory($description, $type);
-
-            if ($mlCategory !== null && $mlCategory !== "Uncertain") {
-                $finalCategory = $mlCategory;
-            } elseif ($keywordCategory !== null) {
-                $finalCategory = $keywordCategory;
-                $this->trainMlCategory($description, $type, $keywordCategory);
-            } else {
-                $finalCategory = 'Uncertain';
-            }
+            // --- Determine the Category Using the Shared Functions ---
+            $finalCategory = $this->determineCategory($description, $type, $this->categories);
             $category = $finalCategory;
 
             if ($balanceVal > 1000000000) {
@@ -223,8 +211,10 @@ class PdfOcrController extends Controller
                 'type'        => $type,
             ]);
 
+            // If amounts are non-zero, process as a new transaction.
             if ($debit != 0.0 || $credit != 0.0 || $balanceVal != 0.0) {
-                $lastTransaction = $statementRecord->vtableRecords()->create([
+                // Build the transaction data array.
+                $transactionData = [
                     'transaction_date' => $lastTransactionDate,
                     'description'      => $description,
                     'category'         => $category,
@@ -232,13 +222,23 @@ class PdfOcrController extends Controller
                     'credit'           => $credit,
                     'balance'          => $balanceVal,
                     'type'             => $type,
-                ]);
+                ];
+
+                // Auto-determine the uncertain flag using the transaction data.
+                $uncertain = $this->autoDetermineUncertainFlag($transactionData, $this->categories);
+
+                // Save the transaction data accordingly.
+                $this->saveTransactionData($statementRecord, $transactionData, $uncertain);
+
+                // Update lastTransaction to the latest saved Transaction record.
+                $lastTransaction = $statementRecord->transactions()->latest()->first();
             } else {
+                // If amounts are zero, merge description with the last transaction.
                 if ($lastTransaction) {
                     $mergedDescription = trim($lastTransaction->description . ' ' . $description);
                     $lastTransaction->update([
                         'description' => substr($mergedDescription, 0, 100),
-                        'category'    => $this->determineCategory($mergedDescription, $type)
+                        'category'    => $this->determineCategory($mergedDescription, $type, $this->categories)
                     ]);
                 }
             }
@@ -262,103 +262,5 @@ class PdfOcrController extends Controller
             'statement' => $statementRecord,
             'raw_text'  => $extractedText,
         ]);
-    }
-
-    /**
-     * Determines the category of a transaction using both ML prediction and keyword matching.
-     *
-     * @param string $description
-     * @param string $type
-     * @return string
-     */
-    private function determineCategory($description, $type)
-    {
-        $mlCategory = $this->getMlCategory($description, $type);
-        $keywordCategory = $this->keywordMatchCategory($description, $type);
-
-        if ($mlCategory !== null && $mlCategory !== "Uncertain") {
-            return $mlCategory;
-        } elseif ($keywordCategory !== null) {
-            $this->trainMlCategory($description, $type, $keywordCategory);
-            return $keywordCategory;
-        }
-        return 'Uncertain';
-    }
-
-    /**
-     * Uses keyword matching to determine a category.
-     *
-     * @param string $description
-     * @param string $type
-     * @return string|null
-     */
-    private function keywordMatchCategory($description, $type)
-    {
-        $description = strtolower($description);
-        foreach ($this->categories as $cat) {
-            if (strcasecmp($cat['type'], $type) !== 0) {
-                continue;
-            }
-            foreach ($cat['keywords'] as $keyword) {
-                if (preg_match('/\b' . preg_quote(strtolower($keyword), '/') . '\b/', $description)) {
-                    return $cat['name'];
-                }
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Calls the ML service to get a predicted category.
-     *
-     * @param string $description
-     * @param string $type
-     * @return string|null
-     */
-    private function getMlCategory($description, $type)
-    {
-        try {
-            $client = new Client(['timeout' => 5]);
-            $response = $client->post('http://ml:5000/predict', [
-                'json' => [
-                    'text' => $description,
-                    'type' => $type
-                ]
-            ]);
-            $result = json_decode($response->getBody(), true);
-            if (isset($result['category']) && !empty($result['category'])) {
-                $confidence = isset($result['confidence']) ? (float)$result['confidence'] : 1.0;
-                if ($confidence >= 0.7) {
-                    return $result['category'];
-                }
-                Log::info("ML prediction confidence too low ({$confidence}) for: {$description}");
-            }
-        } catch (\Exception $e) {
-            Log::error("ML service error: " . $e->getMessage());
-        }
-        return null;
-    }
-
-    /**
-     * Trains the ML service with the provided category.
-     *
-     * @param string $description
-     * @param string $type
-     * @param string $category
-     */
-    private function trainMlCategory($description, $type, $category)
-    {
-        try {
-            $client = new Client(['timeout' => 5]);
-            $client->post('http://ml:5000/train', [
-                'json' => [
-                    'text'     => $description,
-                    'type'     => $type,
-                    'category' => $category
-                ]
-            ]);
-        } catch (\Exception $e) {
-            Log::error("ML training error: " . $e->getMessage());
-        }
     }
 }

@@ -1,9 +1,18 @@
 FROM python:3.10-slim
 WORKDIR /app
 
-# Copy requirements and install dependencies
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Disable hash checking by creating /etc/pip.conf (optional)
+RUN echo "[global]\nrequire-hashes = false" > /etc/pip.conf
+
+# Copy requirements and install dependencies with increased timeout
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && pip install --default-timeout=100 -r requirements.txt
 
 # Pre-download required NLTK resources to avoid runtime delays
 RUN python -c "import nltk; nltk.download('wordnet'); nltk.download('omw-1.4')"

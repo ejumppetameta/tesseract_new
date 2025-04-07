@@ -2,28 +2,53 @@ import os
 import pickle
 import io
 import csv
+import torch
 from flask import Flask, request, jsonify, send_file, Response
 from reportlab.pdfgen import canvas
+from transformers import AutoTokenizer, AutoModel
 
 # Define paths based on current script directory
 script_dir = os.path.dirname(os.path.abspath(__file__))
 model_category_path = os.path.join(script_dir, 'model_category.pkl')
 model_type_path = os.path.join(script_dir, 'model_type.pkl')
-vectorizer_path = os.path.join(script_dir, 'vectorizer.pkl')
 le_category_path = os.path.join(script_dir, 'le_category.pkl')
 le_type_path = os.path.join(script_dir, 'le_type.pkl')
+bert_save_dir = os.path.join(script_dir, 'bert')
 
-# Load trained models, vectorizer, and label encoders
+# Load trained models and label encoders
 with open(model_category_path, 'rb') as f:
     model_category = pickle.load(f)
 with open(model_type_path, 'rb') as f:
     model_type = pickle.load(f)
-with open(vectorizer_path, 'rb') as f:
-    vectorizer = pickle.load(f)
 with open(le_category_path, 'rb') as f:
     le_category = pickle.load(f)
 with open(le_type_path, 'rb') as f:
     le_type = pickle.load(f)
+
+# Load BERT tokenizer and model
+tokenizer = AutoTokenizer.from_pretrained(bert_save_dir)
+bert_model = AutoModel.from_pretrained(bert_save_dir)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+bert_model.to(device)
+bert_model.eval()
+
+def get_bert_embedding(text, batch_size=1):
+    """
+    Generate BERT embedding for the given text by averaging the token embeddings
+    from the last hidden state.
+    """
+    encoded = tokenizer(
+        text,
+        padding=True,
+        truncation=True,
+        return_tensors="pt"
+    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+    with torch.no_grad():
+        output = bert_model(**encoded)
+    # Average pooling over the tokens (dim=1) to get a single vector
+    embedding = output.last_hidden_state.mean(dim=1)
+    return embedding.cpu().numpy()
 
 app = Flask(__name__)
 
@@ -34,9 +59,10 @@ def predict():
         return jsonify({'error': "Missing 'text' field in request data"}), 400
 
     description = data['text']
-    X = vectorizer.transform([description])
+    # Generate BERT embedding for the input text
+    X = get_bert_embedding(description)
 
-    # Predict with probabilities
+    # Predict with probabilities using the BERT embeddings
     category_proba = model_category.predict_proba(X)[0]
     type_proba = model_type.predict_proba(X)[0]
 
@@ -65,6 +91,12 @@ def predict():
         'type': predicted_type,
         'type_confidence': confidence_type
     })
+
+@app.route('/train', methods=['POST'])
+def train():
+    # Note: XGBoost models do not support incremental training via partial_fit.
+    # Hence, this endpoint will return an error if invoked.
+    return jsonify({'error': 'Incremental training is not supported for the current model.'}), 500
 
 @app.route('/download/pdf')
 def download_pdf():
@@ -100,5 +132,5 @@ def download_csv():
     output.seek(0)
     return Response(output.getvalue(), mimetype='text/csv', headers={"Content-Disposition": "attachment;filename=statement.csv"})
 
-if (__name__ == '__main__'):
+if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

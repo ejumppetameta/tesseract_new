@@ -18,15 +18,19 @@ class BankStatement extends Model
         'closing_balance',
     ];
 
+    /**
+     * Relationship to the Transaction records.
+     */
     public function transactions()
     {
-        return $this->hasMany(Transaction::class);
+        return $this->hasMany(Transaction::class , 'bank_statement_id');
     }
 
-    // New relationship for VTable records
+    /**
+     * Relationship to the VTable records.
+     */
     public function vtableRecords()
     {
         return $this->hasMany(VTable::class, 'bank_statement_id');
     }
 }
-
