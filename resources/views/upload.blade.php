@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <!-- Ensure proper scaling on mobile devices -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Financial Dashboard - Bank Statement OCR</title>
+  <title>Financial Dashboard - Bank Statement OCR / CSV</title>
   <!-- Import Google Font: Poppins -->
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
@@ -215,26 +215,31 @@
   <!-- Sidebar -->
   <div class="sidebar" id="sidebar">
     <h2>Manage Categories</h2>
-    <!-- "Go to Categories Page" button loads the categories.blade.php view -->
-    <button class="categories-button" onclick="window.location.href='{{ url('/categories') }}'">Go to Categories Page</button>
-    <!-- "Train Data" button with original URL -->
-    <button class="extra-button" onclick="window.location.href='/train-data/upload'">Train Data</button>
+    <button class="categories-button" onclick="window.location.href='{{ url('/categories') }}'">
+      Go to Categories Page
+    </button>
+    <button class="extra-button" onclick="window.location.href='/train-data/upload'">
+      Train Data
+    </button>
   </div>
 
   <!-- Main Container -->
   <div class="container">
-    <h1>Upload Bank Statement PDF</h1>
+    <h1>Upload Bank Statement File</h1>
     <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
       @csrf
-      <label for="pdfType">Select PDF Type:</label>
-      <select id="pdfType" name="pdfType">
-        <option value="public">Public Bank Statement</option>
-        <option value="creditSense">Credit Sense Statement</option>
+      <!-- File type selection: PDF (OCR), CSV, Maybank, Credit Sense, Public -->
+      <label for="fileType">Select File Type:</label>
+      <select id="fileType" name="fileType">
+        <option value="pdf">PDF (OCR)</option>
+        <option value="csv">CSV</option>
         <option value="maybank">Maybank Statement</option>
+        <option value="creditSense">Credit Sense Statement</option>
+        <option value="public">Public Bank Statement</option>
       </select>
 
-      <label for="pdf">Select PDF:</label>
-      <input type="file" id="pdf" name="pdf" required>
+      <label for="file">Select File:</label>
+      <input type="file" id="file" name="file" required>
 
       <button type="submit">Upload and Process</button>
 
@@ -271,22 +276,25 @@
       this.classList.remove('active');
     });
 
-    // Update form action based on PDF type selection
+    // Update form action based on file type selection
     const form = document.getElementById('uploadForm');
-    const pdfTypeSelect = document.getElementById('pdfType');
+    const fileTypeSelect = document.getElementById('fileType');
 
     function updateFormAction() {
-      const type = pdfTypeSelect.value;
-      if (type === 'creditSense') {
+      const type = fileTypeSelect.value;
+      if (type === 'csv') {
+        // Process CSV with the CSV controller route
+        form.action = "{{ route('process-csv') }}";
+      } else if (type === 'creditSense') {
         form.action = "{{ route('process-pdf-credit-sense') }}";
       } else if (type === 'maybank') {
         form.action = "{{ route('process-pdf-maybank') }}";
-      } else {
+      } else if (type === 'public' || type === 'pdf') {
         form.action = "{{ route('process-pdf-public') }}";
       }
     }
     updateFormAction();
-    pdfTypeSelect.addEventListener('change', updateFormAction);
+    fileTypeSelect.addEventListener('change', updateFormAction);
 
     // Helper function to update the progress bar.
     function updateProgressBar(percent) {
