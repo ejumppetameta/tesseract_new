@@ -43,3 +43,9 @@ Route::get('/statement/{id}/download/csv', [StatementController::class, 'downloa
 
 Route::get('/train-data/upload', [TrainDataController::class, 'index'])->name('train_data.index');
 Route::post('/train-data/upload', [TrainDataController::class, 'upload'])->name('train_data.upload');
+
+
+use App\Http\Controllers\ReportController;
+
+Route::get('/reports', [ReportController::class, 'index'])->name('reports.index');
+Route::get('/reports/{id}', [ReportController::class, 'show'])->name('reports.show');
