@@ -25,18 +25,28 @@ trait PdfOcrCommonTrait
                 ]
             ]);
             $result = json_decode($response->getBody(), true);
+
+            if (!is_array($result)) {
+                Log::warning("ML service returned non-array response for description: {$description}, type: {$type}");
+                return null;
+            }
+
             if (isset($result['category']) && !empty($result['category'])) {
-                // Handle possible differences in confidence key names.
                 $confidence = isset($result['confidence'])
                     ? (float)$result['confidence']
                     : (isset($result['category_confidence']) ? (float)$result['category_confidence'] : 1.0);
                 if ($confidence >= 0.1) {
                     return $result['category'];
                 }
-                Log::info("ML prediction confidence too low ({$confidence}) for: {$description}");
+                Log::info("ML prediction confidence too low ({$confidence}) for description: {$description}");
+            } else {
+                Log::info("ML service did not return a category for description: {$description}");
             }
         } catch (\Exception $e) {
-            Log::error("ML service error: " . $e->getMessage());
+            Log::error("ML service error in getMlCategory: " . $e->getMessage(), [
+                'description' => $description,
+                'type' => $type
+            ]);
         }
         return null;
     }
@@ -51,16 +61,34 @@ trait PdfOcrCommonTrait
      */
     protected function keywordMatchCategory($description, $type, array $categories = [])
     {
-        $description = strtolower($description);
-        foreach ($categories as $cat) {
-            if (strcasecmp($cat['type'], $type) !== 0) {
-                continue;
-            }
-            foreach ($cat['keywords'] as $keyword) {
-                if (preg_match('/\b' . preg_quote(strtolower($keyword), '/') . '\b/', $description)) {
-                    return $cat['name'];
+        try {
+            $description = strtolower($description);
+            foreach ($categories as $cat) {
+                // Ensure the category structure has the necessary keys.
+                if (!isset($cat['type'], $cat['keywords'], $cat['name'])) {
+                    Log::warning("Category data structure is missing keys", ['category' => $cat]);
+                    continue;
+                }
+
+                if (strcasecmp($cat['type'], $type) !== 0) {
+                    continue;
+                }
+                foreach ($cat['keywords'] as $keyword) {
+                    // Make sure the keyword is a valid string.
+                    if (!is_string($keyword) || empty($keyword)) {
+                        continue;
+                    }
+                    if (preg_match('/\b' . preg_quote(strtolower($keyword), '/') . '\b/', $description)) {
+                        return $cat['name'];
+                    }
                 }
             }
+        } catch (\Exception $e) {
+            Log::error("Error in keywordMatchCategory: " . $e->getMessage(), [
+                'description' => $description,
+                'type' => $type,
+                'categories' => $categories,
+            ]);
         }
         return null;
     }
@@ -75,15 +103,24 @@ trait PdfOcrCommonTrait
      */
     protected function determineCategory($description, $type, array $categories)
     {
-        $mlCategory = $this->getMlCategory($description, $type);
-        $keywordCategory = $this->keywordMatchCategory($description, $type, $categories);
+        try {
+            $mlCategory = $this->getMlCategory($description, $type);
+            if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+                return $mlCategory;
+            }
 
-        if ($mlCategory !== null && $mlCategory !== "Uncertain") {
-            return $mlCategory;
-        } elseif ($keywordCategory !== null) {
-            // Optionally train ML with the keyword category.
-            $this->trainMlCategory($description, $type, $keywordCategory);
-            return $keywordCategory;
+            $keywordCategory = $this->keywordMatchCategory($description, $type, $categories);
+            if ($keywordCategory !== null) {
+                // Train the ML service asynchronously; log any failures.
+                $this->trainMlCategory($description, $type, $keywordCategory);
+                return $keywordCategory;
+            }
+        } catch (\Exception $e) {
+            Log::error("Error in determineCategory: " . $e->getMessage(), [
+                'description' => $description,
+                'type' => $type,
+                'categories' => $categories,
+            ]);
         }
         return 'Uncertain';
     }
@@ -97,11 +134,19 @@ trait PdfOcrCommonTrait
      */
     protected function storeTrainingData($description, $type, $category)
     {
-        TrainData::create([
-            'description' => $description,
-            'type'        => $type,
-            'category'    => $category,
-        ]);
+        try {
+            TrainData::create([
+                'description' => $description,
+                'type'        => $type,
+                'category'    => $category,
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error in storeTrainingData: " . $e->getMessage(), [
+                'description' => $description,
+                'type' => $type,
+                'category' => $category,
+            ]);
+        }
     }
 
     /**
@@ -113,7 +158,7 @@ trait PdfOcrCommonTrait
      */
     protected function trainMlCategory($description, $type, $category)
     {
-        // Store the training example.
+        // Store training data regardless of external call outcome.
         $this->storeTrainingData($description, $type, $category);
 
         try {
@@ -126,20 +171,19 @@ trait PdfOcrCommonTrait
                 ]
             ]);
         } catch (\Exception $e) {
-            Log::error("ML training error: " . $e->getMessage());
+            Log::error("ML training error in trainMlCategory: " . $e->getMessage(), [
+                'description' => $description,
+                'type' => $type,
+                'category' => $category,
+            ]);
         }
     }
 
     /**
      * Automatically determines the "uncertain" flag based solely on the provided transaction data.
      *
-     * The logic is as follows:
-     *   - First, determine the final category using determineCategory().
-     *   - If the final category is not "Uncertain", then return 0.
-     *   - If the final category is "Uncertain", then:
-     *       - If ML returns a confident category, return 1.
-     *       - Else if keyword matching returns a category, return 2.
-     *       - Otherwise, return 0.
+     * If the environment variable MANUAL_UNCERTAIN_FLAG is set, this function immediately returns that
+     * value (cast to int) and bypasses the usual auto-detection. Otherwise, the default logic is executed.
      *
      * @param array $transactionData  The transaction data array (should include 'description' and 'type').
      * @param array $categories       Array of category definitions.
@@ -147,28 +191,34 @@ trait PdfOcrCommonTrait
      */
     protected function autoDetermineUncertainFlag(array $transactionData, array $categories)
     {
+        if (!is_null(env('MANUAL_UNCERTAIN_FLAG'))) {
+            return (int)env('MANUAL_UNCERTAIN_FLAG');
+        }
+
         $description = $transactionData['description'] ?? '';
         $type = $transactionData['type'] ?? '';
 
-        // First, get the final determined category.
-        $finalCategory = $this->determineCategory($description, $type, $categories);
+        try {
+            $finalCategory = $this->determineCategory($description, $type, $categories);
+            if ($finalCategory !== "Uncertain") {
+                return 0;
+            }
 
-        // If a clear category (not "Uncertain") is determined, use flag 0.
-        if ($finalCategory !== "Uncertain") {
-            return 0;
+            $mlCategory = $this->getMlCategory($description, $type);
+            if ($mlCategory !== null && $mlCategory !== "Uncertain") {
+                return 1;
+            }
+
+            $keywordCategory = $this->keywordMatchCategory($description, $type, $categories);
+            if ($keywordCategory !== null) {
+                return 2;
+            }
+        } catch (\Exception $e) {
+            Log::error("Error in autoDetermineUncertainFlag: " . $e->getMessage(), [
+                'transactionData' => $transactionData,
+                'categories' => $categories,
+            ]);
         }
-
-        // Otherwise (if finalCategory is "Uncertain"), try to differentiate:
-        $mlCategory = $this->getMlCategory($description, $type);
-        if ($mlCategory !== null && $mlCategory !== "Uncertain") {
-            return 1;
-        }
-
-        $keywordCategory = $this->keywordMatchCategory($description, $type, $categories);
-        if ($keywordCategory !== null) {
-            return 2;
-        }
-
         return 0;
     }
 
@@ -176,30 +226,35 @@ trait PdfOcrCommonTrait
      * Saves transaction data into one or more tables based on the "uncertain" flag.
      *
      * Revised rules:
-     *   - If $uncertain equals 0: Save into Transaction and store training data.
+     *   - If $uncertain equals 0: Save into Transaction.
      *   - If $uncertain equals 1: Save into Transaction and VTable.
-     *   - If $uncertain is greater than 1: Save into Transaction, VTable, and store training data.
+     *   - If $uncertain is greater than 1: Save into Transaction, VTable, and optionally store training data.
      *
-     * @param \Illuminate\Database\Eloquent\Model $bankStatement  The bank statement model instance.
-     * @param array $data  Array of transaction data (must include keys: description, type, category, etc.).
-     * @param int $uncertain  The flag that determines the saving strategy.
+     * @param \Illuminate\Database\Eloquent\Model $bankStatement The bank statement model instance.
+     * @param array $data Array of transaction data (must include keys: description, type, category, etc.).
+     * @param int $uncertain The flag that determines the saving strategy.
      * @return void
      */
     protected function saveTransactionData($bankStatement, array $data, $uncertain)
     {
-        // Always save into Transaction (include uncertain_flag if your table has that column)
-        $bankStatement->transactions()->create(array_merge($data, ['uncertain_flag' => $uncertain]));
+        try {
+            // Save into Transaction table.
+            $bankStatement->transactions()->create(array_merge($data, ['uncertain_flag' => $uncertain]));
 
-        if ($uncertain === 0) {
-            // If uncertain flag equals 0 → save training data.
-            // $this->storeTrainingData($data['description'], $data['type'], $data['category']);
-        } elseif ($uncertain === 1) {
-            // If uncertain flag equals 1 → also save into VTable.
-            $bankStatement->vtableRecords()->create($data);
-        } elseif ($uncertain > 1) {
-            // If uncertain flag is greater than 1 → save into VTable and store training data.
-            $bankStatement->vtableRecords()->create($data);
-            // $this->storeTrainingData($data['description'], $data['type'], $data['category']);
+            if ($uncertain === 1) {
+                // Save into VTable when flag equals 1.
+                $bankStatement->vtableRecords()->create($data);
+            } elseif ($uncertain > 1) {
+                // Save into VTable and optionally train further when flag is greater than 1.
+                $bankStatement->vtableRecords()->create($data);
+                // Uncomment below if training data should be stored automatically.
+                // $this->storeTrainingData($data['description'], $data['type'], $data['category']);
+            }
+        } catch (\Exception $e) {
+            Log::error("Error in saveTransactionData: " . $e->getMessage(), [
+                'data' => $data,
+                'uncertain_flag' => $uncertain,
+            ]);
         }
     }
 }

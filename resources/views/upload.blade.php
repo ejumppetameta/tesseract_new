@@ -4,16 +4,12 @@
   <meta charset="UTF-8">
   <!-- Ensure proper scaling on mobile devices -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Financial Dashboard - Bank Statement OCR / CSV</title>
+  <title>Financial Dashboard - Bank Statement OCR</title>
   <!-- Import Google Font: Poppins -->
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;700&display=swap" rel="stylesheet">
   <style>
     /* Base Reset and global styles */
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: 'Poppins', sans-serif;
       background: linear-gradient(135deg, #E0EAFC, #CFDEF3);
@@ -215,31 +211,28 @@
   <!-- Sidebar -->
   <div class="sidebar" id="sidebar">
     <h2>Manage Categories</h2>
-    <button class="categories-button" onclick="window.location.href='{{ url('/categories') }}'">
-      Go to Categories Page
-    </button>
-    <button class="extra-button" onclick="window.location.href='/train-data/upload'">
-      Train Data
-    </button>
+    <!-- "Go to Categories Page" button loads the categories.blade.php view -->
+    <button class="categories-button" onclick="window.location.href='{{ url('/categories') }}'">Go to Categories Page</button>
+    <!-- "Train Data" button with original URL -->
+    <button class="extra-button" onclick="window.location.href='/train-data/upload'">Train Data</button>
   </div>
 
   <!-- Main Container -->
   <div class="container">
-    <h1>Upload Bank Statement File</h1>
+    <h1>Upload Bank Statement</h1>
     <form id="uploadForm" action="" method="POST" enctype="multipart/form-data">
       @csrf
-      <!-- File type selection: PDF (OCR), CSV, Maybank, Credit Sense, Public -->
-      <label for="fileType">Select File Type:</label>
-      <select id="fileType" name="fileType">
-        <option value="pdf">PDF (OCR)</option>
-        <option value="csv">CSV</option>
-        <option value="maybank">Maybank Statement</option>
-        <option value="creditSense">Credit Sense Statement</option>
-        <option value="public">Public Bank Statement</option>
+      <label for="pdfType">Select Statement Type:</label>
+      <select id="pdfType" name="pdfType">
+        <option value="public">Public Bank Statement (PDF)</option>
+        <option value="creditSense">Credit Sense Statement (PDF)</option>
+        <option value="maybank">Maybank Statement (PDF)</option>
+        <option value="csv">CSV Statement</option>
       </select>
 
-      <label for="file">Select File:</label>
-      <input type="file" id="file" name="file" required>
+      <!-- The file input will dynamically update its name and label -->
+      <label id="fileLabel" for="fileInput">Select PDF:</label>
+      <input type="file" id="fileInput" name="pdf" required>
 
       <button type="submit">Upload and Process</button>
 
@@ -276,25 +269,38 @@
       this.classList.remove('active');
     });
 
-    // Update form action based on file type selection
+    // Update form action and file input attributes based on statement type selection
     const form = document.getElementById('uploadForm');
-    const fileTypeSelect = document.getElementById('fileType');
+    const pdfTypeSelect = document.getElementById('pdfType');
+    const fileInput = document.getElementById('fileInput');
+    const fileLabel = document.getElementById('fileLabel');
 
     function updateFormAction() {
-      const type = fileTypeSelect.value;
-      if (type === 'csv') {
-        // Process CSV with the CSV controller route
-        form.action = "{{ route('process-csv') }}";
-      } else if (type === 'creditSense') {
+      const type = pdfTypeSelect.value;
+      if (type === 'creditSense') {
         form.action = "{{ route('process-pdf-credit-sense') }}";
       } else if (type === 'maybank') {
         form.action = "{{ route('process-pdf-maybank') }}";
-      } else if (type === 'public' || type === 'pdf') {
+      } else if (type === 'csv') {
+        // CSV processing route; update file input name and label.
+        form.action = "{{ route('process-csv') }}";
+        fileInput.name = "csv";
+        fileLabel.textContent = "Select CSV File:";
+        // Optionally adjust accepted file types:
+        fileInput.accept = ".csv, .txt";
+      } else {
         form.action = "{{ route('process-pdf-public') }}";
       }
+      // For PDF types, ensure the input name is 'pdf' and accepted type is pdf
+      if (type !== 'csv') {
+        fileInput.name = "pdf";
+        fileLabel.textContent = "Select PDF:";
+        fileInput.accept = "application/pdf";
+      }
     }
+    // Initialize form action and file input attributes on page load
     updateFormAction();
-    fileTypeSelect.addEventListener('change', updateFormAction);
+    pdfTypeSelect.addEventListener('change', updateFormAction);
 
     // Helper function to update the progress bar.
     function updateProgressBar(percent) {

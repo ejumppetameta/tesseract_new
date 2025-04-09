@@ -18,8 +18,8 @@ Route::post('/process-pdf-public', [PdfOcrController::class, 'process'])->name('
 Route::post('/process-pdf-credit-sense', [PdfOcrControllerCreditSense::class, 'process'])->name('process-pdf-credit-sense');
 Route::post('/process-pdf-maybank', [PdfOcrControllerMaybank::class, 'process'])->name('process-pdf-maybank');
 
-// Route for processing CSV file uploads into VTable.
 Route::post('/csv-statement', [CsvVtableController::class, 'process'])->name('process-csv');
+
 
 // API endpoints for category management (accessible under /api/categories)
 Route::prefix('api')->group(function () {
